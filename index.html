@@ -310,14 +310,16 @@ function trimExtract(text) {
   }
   let out = '';
   for (const s of sentences) {
-    const candidate = (out + ' ' + s).trim();
+    const trimmedS = s.trim();
+    const candidate = out ? `${out} ${trimmedS}` : trimmedS;
     if (candidate.length > 340) break;
     out = candidate;
     if (out.length >= 180) break;
   }
   if (out.length < 100) {
-    out = sentences.slice(0, 3).join(' ').trim();
+    out = sentences.map(s => s.trim()).join(' ');
   }
+  out = out.replace(/\s+/g, ' ').trim();
   if (out.length < 60) return null;
   if (out.length > 420) out = out.slice(0, 420).trim();
   if (/[\[\]{}<>|]/.test(out)) return null;
