@@ -171,6 +171,12 @@
   .modal-english { font-family: 'Inter', sans-serif; font-size: 15px; line-height: 1.6; color: var(--text); padding: 10px 12px; background: var(--card-alt); border: 1px solid var(--border); border-radius: var(--radius); }
   .modal-english.loading { color: var(--text-muted); font-style: italic; }
   .modal-english.error { color: var(--danger); border-color: var(--danger); }
+  .modal-actions { display: flex; gap: 10px; justify-content: flex-end; padding: 12px 18px 16px; }
+  .modal-btn { padding: 8px 16px; border-radius: var(--radius); font-family: 'Inter', sans-serif; font-size: 13px; cursor: pointer; border: 1px solid var(--border); background: var(--surface); color: var(--text-muted); transition: all 0.15s; }
+  .modal-btn:hover { color: var(--text); }
+  .modal-btn.primary { background: linear-gradient(135deg, #3b5fc0, #4f8ef7); border-color: transparent; color: white; }
+  .modal-btn.primary:hover { opacity: 0.9; color: white; }
+  .modal-text { color: var(--text-muted); font-size: 14px; line-height: 1.55; }
   .icon-btn.info:hover { border-color: var(--accent2); color: var(--accent2); }
   .icon-btn.speak:hover { border-color: var(--accent2); color: var(--accent2); }
   .icon-btn.speak.playing { border-color: var(--accent); color: var(--accent); background: rgba(79,142,247,0.1); }
@@ -190,7 +196,7 @@
   <div class="header-right">
     <div class="stat-pill">Done <b id="done-count">0</b>/5</div>
     <div class="stat-pill">Accuracy <b id="accuracy">—</b></div>
-    <button class="btn btn-refresh" id="refresh-btn" onclick="loadParagraphs()">
+    <button class="btn btn-refresh" id="refresh-btn">
       <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
       <span id="refresh-label">Refresh</span>
     </button>
@@ -237,6 +243,24 @@
   </div>
 </div>
 
+<div class="modal-backdrop" id="confirm-backdrop">
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="confirm-title">
+    <div class="modal-head">
+      <div class="modal-title" id="confirm-title">Load new paragraphs?</div>
+      <button class="modal-close" id="confirm-close" aria-label="Close">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+      </button>
+    </div>
+    <div class="modal-body">
+      <p class="modal-text">This will replace your current paragraphs and clear what you've typed so far. Your progress can't be recovered.</p>
+    </div>
+    <div class="modal-actions">
+      <button class="modal-btn" id="confirm-cancel">Cancel</button>
+      <button class="modal-btn primary" id="confirm-ok">Load new paragraphs</button>
+    </div>
+  </div>
+</div>
+
 <script>
 /* ─── Categories: 5 cards, one per category, fetched from DR RSS via CORS proxy ─── */
 const CATEGORIES = [
@@ -265,9 +289,33 @@ let paragraphs = [];   // current strings, one per category
 let cardMeta = [];     // [{label, source, fromFallback}]
 let states = [];       // [{typed: string}]
 
+const STORAGE_KEY = 'danskskriv:session:v1';
 const cardsEl = document.getElementById('cards');
 const refreshBtn = document.getElementById('refresh-btn');
 const refreshLabel = document.getElementById('refresh-label');
+
+function saveSession() {
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({
+      paragraphs,
+      cardMeta,
+      typed: states.map(s => s.typed),
+    }));
+  } catch (_) { /* quota or private mode — ignore */ }
+}
+function loadSession() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (!raw) return null;
+    const data = JSON.parse(raw);
+    if (!Array.isArray(data?.paragraphs) || data.paragraphs.length === 0) return null;
+    if (!Array.isArray(data.typed) || data.typed.length !== data.paragraphs.length) return null;
+    if (!Array.isArray(data.cardMeta) || data.cardMeta.length !== data.paragraphs.length) return null;
+    return data;
+  } catch (_) {
+    return null;
+  }
+}
 const doneCountEl = document.getElementById('done-count');
 const accuracyEl = document.getElementById('accuracy');
 const overallAccEl = document.getElementById('overall-accuracy');
@@ -328,23 +376,30 @@ function trimExtract(text) {
 
 /* Fetch one DR RSS feed via rss2json (CORS-enabled JSON), return a paragraph built from latest items */
 async function fetchCategoryParagraph(category) {
-  const url = RSS_API + encodeURIComponent(category.rss);
-  const res = await fetch(url);
+  // Cache-buster so Chrome (and the rss2json CDN) don't serve a 30-minute-old response on refresh.
+  const bust = `&_=${Math.floor(performance.now() * 1000)}`;
+  const url = RSS_API + encodeURIComponent(category.rss) + bust;
+  const res = await fetch(url, { cache: 'no-store' });
   if (!res.ok) throw new Error('http ' + res.status);
   const data = await res.json();
   if (data.status !== 'ok' || !Array.isArray(data.items) || data.items.length === 0) {
     throw new Error('no items');
   }
 
+  // Pick a random starting item from recent items so refresh varies the content
+  // even when DR's feed itself hasn't changed.
+  const items = data.items.slice();
+  const startIdx = Math.floor(Math.random() * Math.min(items.length, 6));
+  const ordered = items.slice(startIdx).concat(items.slice(0, startIdx));
+
   // Some DR feeds only have titles. Stitch multiple items together if needed to reach paragraph length.
   const pieces = [];
-  for (const item of data.items) {
+  for (const item of ordered) {
     const title = stripHtml(item.title || '').trim().replace(/[.!?]+$/, '');
     const desc  = stripHtml(item.description || item.content || '').trim();
     const piece = desc ? `${title}. ${desc}` : `${title}.`;
     if (piece.length > 4) pieces.push(piece);
-    const joined = pieces.join(' ');
-    if (joined.length >= 200) break;
+    if (pieces.join(' ').length >= 200) break;
   }
   const combined = pieces.join(' ').replace(/\s+/g, ' ').trim();
   const trimmed = trimExtract(combined);
@@ -389,6 +444,7 @@ async function loadParagraphs() {
   paragraphs = result;
   cardMeta = meta;
   states = paragraphs.map(() => ({ typed: '' }));
+  saveSession();
   render();
 
   refreshBtn.classList.remove('loading');
@@ -492,15 +548,18 @@ function render() {
     cardsEl.appendChild(card);
 
     const ta = card.querySelector(`#ta-${idx}`);
+    ta.value = states[idx].typed || '';
     ta.addEventListener('input', () => {
       states[idx].typed = ta.value;
       updateCard(idx);
+      saveSession();
     });
     card.querySelector(`#reset-${idx}`).addEventListener('click', () => {
       states[idx].typed = '';
       ta.value = '';
       ta.focus();
       updateCard(idx);
+      saveSession();
     });
     card.querySelector(`#info-${idx}`).addEventListener('click', () => {
       openTranslation(idx);
@@ -678,8 +737,43 @@ function toggleSpeak(idx) {
   synth.speak(utter);
 }
 
-/* boot */
-loadParagraphs();
+/* ─── Refresh confirmation ─── */
+const confirmBackdrop = document.getElementById('confirm-backdrop');
+const confirmCloseBtn = document.getElementById('confirm-close');
+const confirmCancelBtn = document.getElementById('confirm-cancel');
+const confirmOkBtn = document.getElementById('confirm-ok');
+
+function openConfirm() { confirmBackdrop.classList.add('show'); }
+function closeConfirm() { confirmBackdrop.classList.remove('show'); }
+
+confirmCloseBtn.addEventListener('click', closeConfirm);
+confirmCancelBtn.addEventListener('click', closeConfirm);
+confirmBackdrop.addEventListener('click', (e) => {
+  if (e.target === confirmBackdrop) closeConfirm();
+});
+confirmOkBtn.addEventListener('click', () => {
+  closeConfirm();
+  loadParagraphs();
+});
+
+refreshBtn.addEventListener('click', () => {
+  openConfirm();
+});
+
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && confirmBackdrop.classList.contains('show')) closeConfirm();
+});
+
+/* boot — rehydrate from localStorage if we have a saved session, otherwise fetch fresh */
+const saved = loadSession();
+if (saved) {
+  paragraphs = saved.paragraphs;
+  cardMeta = saved.cardMeta;
+  states = saved.typed.map(t => ({ typed: t }));
+  render();
+} else {
+  loadParagraphs();
+}
 </script>
 
 </body>
